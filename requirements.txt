@@ -1,0 +1,7 @@
+typer>=0.9
+requests>=2.31
+pydantic>=2
+uvicorn>=0.23
+mcp>=1.0
+jupyter-kernel-client>=0.4
+
