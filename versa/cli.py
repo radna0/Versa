@@ -65,6 +65,9 @@ app.add_typer(modal_app, name="modal")
 cloud_modal_app = typer.Typer(add_completion=False, help="Modal provider: tokens + runs.")
 cloud_app.add_typer(cloud_modal_app, name="modal")
 
+cloud_modal_profile_app = typer.Typer(add_completion=False, help="Modal profiles stored in Versa.")
+cloud_modal_app.add_typer(cloud_modal_profile_app, name="profile")
+
 cloud_kaggle_app = typer.Typer(add_completion=False, help="Kaggle provider: tokens + runs.")
 cloud_app.add_typer(cloud_kaggle_app, name="kaggle")
 
@@ -1988,6 +1991,102 @@ def cloud_modal_tokens_cmd(
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
 ) -> None:
     cloud_modal_tokens(base_url=base_url, admin_key=admin_key)
+
+
+@cloud_modal_profile_app.command("list")
+def cloud_modal_profile_list_cmd(
+    details: bool = typer.Option(False, "--details", help="Show a small table (status/valid/credit/id) instead of names-only."),
+    enabled_only: bool = typer.Option(False, "--enabled-only", help="Only show enabled profiles."),
+    valid_only: bool = typer.Option(False, "--valid-only", help="Only show profiles with valid=true."),
+    credit_only: bool = typer.Option(False, "--credit-only", help="Only show profiles with hasCredit=true."),
+    dedupe: bool = typer.Option(True, "--dedupe/--no-dedupe", help="Names-only mode: collapse duplicates by profile name."),
+    show_ids: bool = typer.Option(False, "--show-ids", help="Show full Versa token row ids (details mode)."),
+    limit: int = typer.Option(0, "--limit", help="Limit number of profiles printed (0 => all)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """List Modal profile names in a readable format (no JSON)."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+
+    j = _cloud_get_json(b, k, "/admin/modal/tokens", timeout_s=60.0)
+    items = j.get("tokens") if isinstance(j, dict) else None
+    if not isinstance(items, list):
+        items = []
+
+    inv_enabled = 0
+    inv_disabled = 0
+    filtered: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        profile = str(it.get("profile") or "").strip()
+        if not profile:
+            continue
+        is_disabled = bool(it.get("disabled"))
+        if is_disabled:
+            inv_disabled += 1
+            if enabled_only:
+                continue
+        else:
+            inv_enabled += 1
+
+        if valid_only and it.get("valid") is not True:
+            continue
+        if credit_only and it.get("hasCredit") is not True:
+            continue
+
+        filtered.append(it)
+
+    # Stable ordering for copy/paste and diffs.
+    filtered.sort(key=lambda x: str(x.get("profile") or "").lower())
+    if limit and limit > 0:
+        filtered = filtered[: int(limit)]
+
+    inv_total = inv_enabled + inv_disabled if not enabled_only else inv_enabled
+    typer.echo(f"Modal profiles: {len(filtered)}/{inv_total} (enabled {inv_enabled}, disabled {inv_disabled})")
+
+    if not details:
+        profiles: list[str] = []
+        if dedupe:
+            seen: set[str] = set()
+            for it in filtered:
+                p = str(it.get("profile") or "").strip()
+                if not p:
+                    continue
+                lp = p.lower()
+                if lp in seen:
+                    continue
+                seen.add(lp)
+                profiles.append(p)
+        else:
+            profiles = [str(it.get("profile") or "").strip() for it in filtered if str(it.get("profile") or "").strip()]
+
+        if limit and limit > 0:
+            profiles = profiles[: int(limit)]
+
+        for i, p in enumerate(profiles, start=1):
+            typer.echo(f"{i:4d}. {p}")
+        return
+
+    def _tri(v: Any) -> str:
+        if v is True:
+            return "yes"
+        if v is False:
+            return "no"
+        return "?"
+
+    table_rows: list[list[str]] = []
+    for it in filtered:
+        profile = str(it.get("profile") or "").strip()
+        status = "disabled" if bool(it.get("disabled")) else "enabled"
+        valid_s = _tri(it.get("valid"))
+        credit_s = _tri(it.get("hasCredit"))
+        row_id = str(it.get("id") or "").strip()
+        row_id_s = row_id if show_ids else _compact_id(row_id)
+        table_rows.append([profile, status, valid_s, credit_s, row_id_s])
+
+    _print_table(["profile", "status", "valid", "credit", "row_id"], table_rows)
 
 
 @cloud_modal_app.command("import")
