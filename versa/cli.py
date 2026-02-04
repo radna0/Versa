@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -180,6 +181,22 @@ def _versa_headers(admin_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {admin_key}", "Accept": "application/json"}
 
 
+def _versa_actor_id(actor_id: str = "") -> str:
+    """Stable per-user id used for lease ownership (prevents account collisions)."""
+    cfg0 = read_local_config()
+    a = (actor_id or os.getenv("VERSA_ACTOR_ID") or (cfg0.actor_id or "")).strip()
+    if a:
+        return a
+
+    # Self-heal: generate a persistent actor id if the user hasn't re-run `versa login`.
+    a = f"va_{uuid.uuid4()}"
+    try:
+        write_local_config(VersaLocalConfig(api_base=cfg0.api_base, admin_key=cfg0.admin_key, actor_id=a))
+    except Exception:
+        pass
+    return a
+
+
 @app.command("login")
 def login(
     admin_key: str = typer.Argument("", help="Admin API key for Versa (stored locally)."),
@@ -195,9 +212,12 @@ def login(
         raise typer.BadParameter("missing_admin_key")
 
     b = (base_url or cfg0.api_base or os.getenv("VERSA_API_BASE") or "https://versa.iseki.cloud").strip().rstrip("/")
-    cfg = VersaLocalConfig(api_base=b, admin_key=k)
+    a = (cfg0.actor_id or os.getenv("VERSA_ACTOR_ID") or "").strip()
+    if not a:
+        a = f"va_{uuid.uuid4()}"
+    cfg = VersaLocalConfig(api_base=b, admin_key=k, actor_id=a)
     p = write_local_config(cfg)
-    typer.echo(f"OK: saved config to {p}")
+    typer.echo(f"OK: saved config to {p} (actor_id={a})")
 
 
 @app.command("logout")
@@ -1290,6 +1310,7 @@ def cloud_runs(
     provider: str = typer.Option("", "--provider", help="Filter by provider: modal|kaggle."),
     status: str = typer.Option("", "--status", help="Filter by status: queued|assigned|running|succeeded|failed|killed..."),
     account_ref: str = typer.Option("", "--account-ref", "--profile", help="Filter by account/profile (kaggle username or modal profile)."),
+    actor_id: str = typer.Option("", "--actor-id", help="Filter by actor_id (owner/client id)."),
     limit: int = typer.Option(50, "--limit", help="Max runs to list (default 50)."),
     base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
@@ -1305,6 +1326,8 @@ def cloud_runs(
         qs.append(f"status={status.strip()}")
     if account_ref.strip():
         qs.append(f"account_ref={account_ref.strip()}")
+    if actor_id.strip():
+        qs.append(f"actor_id={actor_id.strip()}")
 
     path = "/api/runs"
     if qs:
@@ -1406,7 +1429,13 @@ def cloud_run_modal(
         "resources": resources,
         "tags": ["versa", "modal"],
     }
-    payload: dict[str, Any] = {"provider": "modal", "mode": "background", "name": run_name, "spec": spec}
+    payload: dict[str, Any] = {
+        "provider": "modal",
+        "mode": "background",
+        "name": run_name,
+        "spec": spec,
+        "actor_id": _versa_actor_id(""),
+    }
     rp = requested_profile.strip()
     if rp:
         payload["account_ref"] = rp

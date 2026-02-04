@@ -30,20 +30,26 @@ def config_path() -> Path:
 class VersaLocalConfig:
     api_base: str | None = None
     admin_key: str | None = None
+    # Stable per-user identifier for account/lease ownership.
+    # This is how Versa prevents two users from colliding on the same provider profile.
+    actor_id: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "VersaLocalConfig":
         api_base = d.get("api_base")
         admin_key = d.get("admin_key")
+        actor_id = d.get("actor_id") or d.get("actorId") or d.get("client_id") or d.get("clientId")
         return VersaLocalConfig(
             api_base=str(api_base).strip() if isinstance(api_base, str) and api_base.strip() else None,
             admin_key=str(admin_key).strip() if isinstance(admin_key, str) and admin_key.strip() else None,
+            actor_id=str(actor_id).strip() if isinstance(actor_id, str) and actor_id.strip() else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "api_base": self.api_base,
             "admin_key": self.admin_key,
+            "actor_id": self.actor_id,
         }
 
 
@@ -80,4 +86,3 @@ def clear_local_config() -> None:
             p.unlink()
     except Exception:
         pass
-
