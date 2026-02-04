@@ -68,6 +68,9 @@ cloud_app.add_typer(cloud_modal_app, name="modal")
 cloud_kaggle_app = typer.Typer(add_completion=False, help="Kaggle provider: tokens + runs.")
 cloud_app.add_typer(cloud_kaggle_app, name="kaggle")
 
+cloud_kaggle_profile_app = typer.Typer(add_completion=False, help="Kaggle profiles (usernames) stored in Versa.")
+cloud_kaggle_app.add_typer(cloud_kaggle_profile_app, name="profile")
+
 cloud_codex_app = typer.Typer(add_completion=False, help="Codex provider: tokens + refresh.")
 cloud_app.add_typer(cloud_codex_app, name="codex")
 
@@ -113,6 +116,36 @@ def _json_out(obj: Any) -> None:
         return v
 
     typer.echo(json.dumps(_redact(obj), indent=2, sort_keys=True))
+
+
+def _compact_id(s: str, *, head: int = 6, tail: int = 4) -> str:
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    if len(s) <= head + tail + 3:
+        return s
+    return f"{s[:head]}...{s[-tail:]}"
+
+
+def _print_table(headers: list[str], rows: list[list[str]], *, right_align: set[int] | None = None) -> None:
+    """Very small, dependency-free table printer (ASCII, stable on Windows)."""
+    right_align = right_align or set()
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    def _fmt_cell(i: int, v: str) -> str:
+        v = str(v)
+        w = widths[i]
+        if i in right_align:
+            return v.rjust(w)
+        return v.ljust(w)
+
+    typer.echo("  ".join(_fmt_cell(i, h) for i, h in enumerate(headers)))
+    typer.echo("  ".join(("-" * w) for w in widths))
+    for r in rows:
+        typer.echo("  ".join(_fmt_cell(i, v) for i, v in enumerate(r)))
 
 
 def _versa_base_url(base_url: str) -> str:
@@ -2115,6 +2148,76 @@ def cloud_kaggle_delete_cmd(
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
 ) -> None:
     cloud_kaggle_delete(token_id=token_id, base_url=base_url, admin_key=admin_key)
+
+
+@cloud_kaggle_profile_app.command("list")
+def cloud_kaggle_profile_list_cmd(
+    details: bool = typer.Option(False, "--details", help="Show a small table (status/maxConcurrency/id) instead of names-only."),
+    enabled_only: bool = typer.Option(False, "--enabled-only", help="Only show enabled profiles."),
+    show_ids: bool = typer.Option(False, "--show-ids", help="Show full token UUIDs (details mode)."),
+    limit: int = typer.Option(0, "--limit", help="Limit number of profiles printed (0 => all)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """List Kaggle usernames in a readable format (no JSON)."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+
+    j = _cloud_get_json(b, k, "/admin/kaggle/tokens", timeout_s=60.0)
+    items = j.get("tokens") if isinstance(j, dict) else None
+    if not isinstance(items, list):
+        items = []
+
+    rows: list[dict[str, Any]] = []
+    enabled = 0
+    disabled = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        username = str(it.get("username") or "").strip()
+        if not username:
+            continue
+        is_disabled = bool(it.get("disabled"))
+        if is_disabled:
+            disabled += 1
+            if enabled_only:
+                continue
+        else:
+            enabled += 1
+        rows.append(it)
+
+    # Stable ordering for copy/paste and diffs.
+    rows.sort(key=lambda x: str(x.get("username") or "").lower())
+    if limit and limit > 0:
+        rows = rows[: int(limit)]
+
+    total = enabled + disabled if not enabled_only else enabled
+    typer.echo(f"Kaggle profiles: {total} (enabled {enabled}, disabled {disabled})")
+
+    if not details:
+        for i, it in enumerate(rows, start=1):
+            username = str(it.get("username") or "").strip()
+            typer.echo(f"{i:4d}. {username}")
+        return
+
+    table_rows: list[list[str]] = []
+    for it in rows:
+        username = str(it.get("username") or "").strip()
+        label = str(it.get("label") or "").strip()
+        max_c = it.get("maxConcurrency")
+        if max_c is None:
+            max_c = it.get("max_concurrency")
+        try:
+            max_c_s = str(int(max_c or 0))
+        except Exception:
+            max_c_s = str(max_c or "")
+        status = "disabled" if bool(it.get("disabled")) else "enabled"
+        token_id = str(it.get("id") or "").strip()
+        token_id_s = token_id if show_ids else _compact_id(token_id)
+        label_s = label if (label and label != username) else ""
+        table_rows.append([username, label_s, status, max_c_s, token_id_s])
+
+    _print_table(["username", "label", "status", "max", "token_id"], table_rows, right_align={3})
 
 
 @cloud_codex_app.command("tokens")
