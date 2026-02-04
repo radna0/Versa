@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "versa-cli"
+version = "0.1.0"
+description = "Versa CLI (Modal-like multi-provider runner)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "typer>=0.9",
+  "requests>=2.31",
+  "pydantic>=2",
+  "uvicorn>=0.23",
+  "mcp>=1.0",
+  "jupyter-kernel-client>=0.4",
+  "modal>=0.74",
+]
+
+[project.scripts]
+versa = "versa.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["versa*"]
+

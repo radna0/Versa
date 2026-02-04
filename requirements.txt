@@ -4,4 +4,4 @@ pydantic>=2
 uvicorn>=0.23
 mcp>=1.0
 jupyter-kernel-client>=0.4
-
+modal>=0.74
