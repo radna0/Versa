@@ -47,7 +47,18 @@ from versa.remote_jupyter_backend import (
 )
 from versa.versa_runner import versa_run_jupyter, versa_run_modal
 from versa.util import ensure_dir, utc_timestamp
-from versa.config import VersaLocalConfig, clear_local_config, read_local_config, write_local_config
+from versa.config import (
+    VersaLocalConfig,
+    clear_local_config,
+    config_dir,
+    config_path_for_actor,
+    list_actor_config_paths,
+    read_local_config,
+    read_local_config_from,
+    set_active_actor,
+    write_local_config,
+    write_local_config_to,
+)
 
 
 app = typer.Typer(
@@ -80,6 +91,9 @@ cloud_app.add_typer(cloud_codex_app, name="codex")
 
 cloud_kodo_app = typer.Typer(add_completion=False, help="KODO (Codex lease coordinator).")
 cloud_app.add_typer(cloud_kodo_app, name="kodo")
+
+actor_app = typer.Typer(add_completion=False, help="Local actor identities (isolation across engineers/codebases).")
+app.add_typer(actor_app, name="actor")
 
 
 @app.callback()
@@ -177,13 +191,42 @@ def _versa_admin_key(admin_key: str) -> str:
     return k
 
 
-def _versa_headers(admin_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {admin_key}", "Accept": "application/json"}
+def _versa_headers(
+    admin_key: str,
+    *,
+    admin_override: bool = False,
+    actor_id: str = "",
+    actor_name: str = "",
+) -> dict[str, str]:
+    h: dict[str, str] = {"Authorization": f"Bearer {admin_key}", "Accept": "application/json"}
+
+    # Always send actor identity so the server can enforce owner-only kill/finish/log access.
+    # This is also what prevents accidental cross-engineer collisions on shared machines.
+    try:
+        h["X-Versa-Actor-Id"] = _versa_actor_id(actor_id)
+        h["X-Versa-Actor-Name"] = _versa_actor_name(actor_name)
+    except Exception:
+        # Some commands (e.g. `versa login`) run before config is initialized.
+        pass
+
+    if admin_override:
+        h["X-Versa-Admin-Override"] = "1"
+
+    return h
+
+
+def _versa_actor_name(actor_name: str = "") -> str:
+    cfg0 = read_local_config()
+    n = (actor_name or os.getenv("VERSA_ACTOR_NAME") or (cfg0.actor_name or "")).strip()
+    if not n:
+        raise typer.BadParameter("Missing actor name. Run: versa login --actor-name <name> (or set VERSA_ACTOR_NAME).")
+    return n
 
 
 def _versa_actor_id(actor_id: str = "") -> str:
     """Stable per-user id used for lease ownership (prevents account collisions)."""
     cfg0 = read_local_config()
+    _ = _versa_actor_name("")  # enforce explicit actor labeling on shared machines
     a = (actor_id or os.getenv("VERSA_ACTOR_ID") or (cfg0.actor_id or "")).strip()
     if a:
         return a
@@ -191,10 +234,77 @@ def _versa_actor_id(actor_id: str = "") -> str:
     # Self-heal: generate a persistent actor id if the user hasn't re-run `versa login`.
     a = f"va_{uuid.uuid4()}"
     try:
-        write_local_config(VersaLocalConfig(api_base=cfg0.api_base, admin_key=cfg0.admin_key, actor_id=a))
+        write_local_config(
+            VersaLocalConfig(api_base=cfg0.api_base, admin_key=cfg0.admin_key, actor_id=a, actor_name=cfg0.actor_name),
+        )
     except Exception:
         pass
     return a
+
+
+@actor_app.command("current")
+def actor_current() -> None:
+    """Show the currently active actor identity on this machine."""
+    cfg = read_local_config()
+    n = (cfg.actor_name or "").strip() or "(unset)"
+    a = (cfg.actor_id or "").strip() or "(unset)"
+    typer.echo(f"actor_name={n}")
+    typer.echo(f"actor_id={a}")
+    typer.echo(f"config_dir={config_dir()}")
+
+
+@actor_app.command("list")
+def actor_list() -> None:
+    """List local actor configs under `~/.versa/actors/*.json`."""
+    paths = list_actor_config_paths()
+    active = ""
+    try:
+        p = config_dir() / "active_actor.txt"
+        if p.exists():
+            active = p.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        active = ""
+
+    if not paths:
+        typer.echo("No actors yet. Create one with: versa login --actor-name <name>")
+        return
+
+    rows: list[list[str]] = []
+    for p in paths:
+        cfg = read_local_config_from(p)
+        name = str(cfg.actor_name or p.stem)
+        actor_id = str(cfg.actor_id or "")
+        mark = "*" if active and active == name else ""
+        rows.append([mark, name, _compact_id(actor_id), str(p)])
+
+    _print_table(["", "actor_name", "actor_id", "config_path"], rows)
+    if active:
+        typer.echo(f"Active actor: {active}")
+
+
+@actor_app.command("use")
+def actor_use(
+    actor_name: str = typer.Argument(..., help="Actor name to activate (e.g. alice)."),
+    clone: bool = typer.Option(True, "--clone/--no-clone", help="If missing, create config by cloning admin_key/base_url from current actor."),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing actor config when cloning."),
+) -> None:
+    """Switch the active actor (affects subsequent `versa cloud ...` commands)."""
+    name = actor_name.strip()
+    if not name:
+        raise typer.BadParameter("missing_actor_name")
+
+    p = config_path_for_actor(name)
+    if (not p.exists()) and clone:
+        cur = read_local_config()
+        if not cur.admin_key or not cur.api_base:
+            raise typer.BadParameter("missing_current_login (run: versa login --actor-name <name>)")
+        if p.exists() and (not overwrite):
+            raise typer.BadParameter("actor_exists (use --overwrite)")
+        new_cfg = VersaLocalConfig(api_base=cur.api_base, admin_key=cur.admin_key, actor_id=f"va_{uuid.uuid4()}", actor_name=name)
+        write_local_config_to(p, new_cfg)
+
+    set_active_actor(name)
+    typer.echo(f"OK: active_actor={name} ({p})")
 
 
 @app.command("login")
@@ -202,6 +312,8 @@ def login(
     admin_key: str = typer.Argument("", help="Admin API key for Versa (stored locally)."),
     base_url: str = typer.Option("", "--base-url", help="Default Versa API base URL (stored locally)."),
     prompt: bool = typer.Option(False, "--prompt", help="Prompt for the key (avoids putting it in shell history)."),
+    actor_name: str = typer.Option("", "--actor-name", help="Actor name for isolation on shared machines (e.g. alice)."),
+    set_active: bool = typer.Option(True, "--set-active/--no-set-active", help="Make this actor the default on this machine."),
 ) -> None:
     """Store your Versa admin key + default API base URL in `~/.versa/config.json`."""
     cfg0 = read_local_config()
@@ -215,9 +327,20 @@ def login(
     a = (cfg0.actor_id or os.getenv("VERSA_ACTOR_ID") or "").strip()
     if not a:
         a = f"va_{uuid.uuid4()}"
-    cfg = VersaLocalConfig(api_base=b, admin_key=k, actor_id=a)
+
+    n = (actor_name or os.getenv("VERSA_ACTOR_NAME") or (cfg0.actor_name or "")).strip()
+    if not n:
+        raise typer.BadParameter("missing_actor_name (use --actor-name)")
+
+    cfg = VersaLocalConfig(api_base=b, admin_key=k, actor_id=a, actor_name=n)
     p = write_local_config(cfg)
-    typer.echo(f"OK: saved config to {p} (actor_id={a})")
+    if set_active:
+        try:
+            ap = set_active_actor(n)
+            typer.echo(f"OK: active_actor={n} ({ap})")
+        except Exception:
+            pass
+    typer.echo(f"OK: saved config to {p} (actor_name={n} actor_id={a})")
 
 
 @app.command("logout")
@@ -597,22 +720,15 @@ def _parse_modal_profiles_b3(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-@cloud_app.command("modal-probe")
-def cloud_modal_probe(
-    profiles_file: str = typer.Option(
-        "",
-        "--profiles-file",
-        help="TSV file with Modal profiles (default: ~/.versa/modal_profiles_import.txt).",
-    ),
-    source: str = typer.Option(
-        "versa",
-        "--source",
-        help="Where to read Modal profiles from: versa (D1+R2) | file (TSV).",
-    ),
-    concurrency: int = typer.Option(10, "--concurrency", help="Concurrent probes to run."),
-    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
-    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Do not POST updates to Versa; just print JSON."),
+def _cloud_modal_probe_impl(
+    *,
+    profiles_file: str,
+    source: str,
+    concurrency: int,
+    base_url: str,
+    admin_key: str,
+    dry_run: bool,
+    include_disabled: bool,
 ) -> None:
     """
     Probe Modal tokens locally (auth + optional billing report) and write status back to Versa Worker.
@@ -635,7 +751,7 @@ def cloud_modal_probe(
     b = _versa_base_url(base_url)
     k = _versa_admin_key(admin_key)
 
-    src = source.strip().lower()
+    src = (source or "").strip().lower()
     if src not in {"versa", "file"}:
         raise typer.BadParameter("--source must be 'versa' or 'file'")
 
@@ -648,6 +764,8 @@ def cloud_modal_probe(
         for t in toks:
             profile = str(t.get("profile") or t.get("account_ref") or "").strip()
             if not profile:
+                continue
+            if not include_disabled and bool(t.get("disabled")):
                 continue
             items.append(
                 {
@@ -726,8 +844,26 @@ def cloud_modal_probe(
                 quota["workspace"] = getattr(resp, "workspace_name", None) or None
                 valid = True
             except Exception as e:
-                valid = False
-                last_error = f"auth_failed:{type(e).__name__}:{e}"
+                # Treat transient upstream errors as "unknown" instead of flipping a token to invalid.
+                # This avoids poisoning the pool during Modal API incidents.
+                msg = str(e)
+                transient = any(
+                    s in msg
+                    for s in (
+                        "Received :status = '502'",
+                        "Received :status = '503'",
+                        "Received :status = '504'",
+                        "Deadline exceeded",
+                        "timed out",
+                        "Temporary failure",
+                    )
+                )
+                if transient:
+                    valid = None
+                    last_error = f"auth_transient:{type(e).__name__}:{e}"
+                else:
+                    valid = False
+                    last_error = f"auth_failed:{type(e).__name__}:{e}"
 
             if valid:
                 try:
@@ -805,6 +941,35 @@ def cloud_modal_probe(
         sent += len(chunk)
 
     _json_out({"ok": True, "updated": sent, "profiles": len(items)})
+
+
+@cloud_app.command("modal-probe")
+def cloud_modal_probe(
+    profiles_file: str = typer.Option(
+        "",
+        "--profiles-file",
+        help="TSV file with Modal profiles (default: ~/.versa/modal_profiles_import.txt).",
+    ),
+    source: str = typer.Option(
+        "versa",
+        "--source",
+        help="Where to read Modal profiles from: versa (D1+R2) | file (TSV).",
+    ),
+    concurrency: int = typer.Option(10, "--concurrency", help="Concurrent probes to run."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Do not POST updates to Versa; just print JSON."),
+    include_disabled: bool = typer.Option(False, "--include-disabled", help="Also probe disabled/frozen profiles."),
+) -> None:
+    _cloud_modal_probe_impl(
+        profiles_file=profiles_file,
+        source=source,
+        concurrency=concurrency,
+        base_url=base_url,
+        admin_key=admin_key,
+        dry_run=dry_run,
+        include_disabled=include_disabled,
+    )
 
 
 def _normalize_cookie_for_modal(cookie: str) -> str:
@@ -1174,10 +1339,18 @@ def cloud_kaggle_delete(
     _json_out(r.json())
 
 
-def _cloud_post_json(b: str, k: str, path: str, payload: dict[str, Any], timeout_s: float = 60.0) -> dict[str, Any]:
+def _cloud_post_json(
+    b: str,
+    k: str,
+    path: str,
+    payload: dict[str, Any],
+    timeout_s: float = 60.0,
+    *,
+    admin_override: bool = False,
+) -> dict[str, Any]:
     r = requests.post(
         f"{b}{path}",
-        headers={**_versa_headers(k), "Content-Type": "application/json"},
+        headers={**_versa_headers(k, admin_override=admin_override), "Content-Type": "application/json"},
         data=json.dumps(payload),
         timeout=timeout_s,
     )
@@ -1185,18 +1358,144 @@ def _cloud_post_json(b: str, k: str, path: str, payload: dict[str, Any], timeout
     return r.json()
 
 
-def _cloud_get_json(b: str, k: str, path: str, timeout_s: float = 30.0) -> dict[str, Any]:
-    r = requests.get(f"{b}{path}", headers=_versa_headers(k), timeout=timeout_s)
+def _cloud_get_json(
+    b: str,
+    k: str,
+    path: str,
+    timeout_s: float = 30.0,
+    *,
+    admin_override: bool = False,
+) -> dict[str, Any]:
+    r = requests.get(f"{b}{path}", headers=_versa_headers(k, admin_override=admin_override), timeout=timeout_s)
     r.raise_for_status()
     return r.json()
+
+def _cloud_try_json(resp: "requests.Response") -> dict[str, Any] | None:
+    try:
+        j = resp.json()
+        return j if isinstance(j, dict) else None
+    except Exception:
+        return None
+
+
+def _is_terminal_status(status: str) -> bool:
+    st = (status or "").strip().lower()
+    return st in {"succeeded", "failed", "canceled", "killed"}
+
+
+def _cloud_list_active_runs_for_actor(
+    b: str,
+    k: str,
+    *,
+    provider: str,
+    actor_id: str,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    j = _cloud_get_json(b, k, f"/api/runs?provider={provider}&actor_id={actor_id}&limit={int(limit)}", timeout_s=30.0)
+    runs = j.get("runs") if isinstance(j, dict) else None
+    if not isinstance(runs, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        st = str(r.get("status") or "")
+        if _is_terminal_status(st):
+            continue
+        out.append(r)
+    return out
+
+
+def _cloud_force_finish_run(b: str, k: str, run_id: str, *, status: str = "canceled") -> dict[str, Any]:
+    return _cloud_post_json(b, k, f"/api/runs/{run_id}/finished", {"status": status}, timeout_s=30.0)
+
+
+def _cloud_kill_run(b: str, k: str, run_id: str) -> dict[str, Any]:
+    return _cloud_post_json(b, k, f"/api/runs/{run_id}/kill", {}, timeout_s=30.0)
+
+
+@cloud_app.command("release")
+def cloud_release(
+    provider: str = typer.Argument(..., help="Provider to release: modal|kaggle."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Force-release by marking runs finished immediately (releases the lease even if the runner is dead).",
+    ),
+    wait_s: float = typer.Option(
+        120.0,
+        "--wait-s",
+        help="How long to wait for graceful kill to become terminal before failing (ignored with --force).",
+    ),
+    poll_s: float = typer.Option(1.0, "--poll-s", help="Poll interval while waiting."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """
+    Release your currently-held account/profile for a provider.
+
+    Mechanism:
+    - Versa holds accounts via per-run leases.
+    - Releasing means making the run terminal, which releases its lease in the coordinator.
+
+    Graceful (default): send kill to your active runs and wait for them to finish.
+    Force: mark your active runs as finished immediately (releases the lease even if runners are dead).
+    """
+    p = provider.strip().lower()
+    if p not in {"modal", "kaggle"}:
+        raise typer.BadParameter("provider must be modal|kaggle")
+
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+
+    active = _cloud_list_active_runs_for_actor(b, k, provider=p, actor_id=actor_id, limit=500)
+    if not active:
+        typer.echo(f"OK: no active runs for actor_id={actor_id} provider={p}")
+        return
+
+    run_ids = [str(r.get("runId") or r.get("run_id") or "") for r in active]
+    run_ids = [x for x in run_ids if x]
+    if not run_ids:
+        typer.echo(f"OK: no active run ids for actor_id={actor_id} provider={p}")
+        return
+
+    typer.echo(f"[versa] releasing provider={p} actor_id={actor_id} active_runs={len(run_ids)}")
+    if force:
+        for rid in run_ids:
+            _cloud_force_finish_run(b, k, rid, status="canceled")
+        typer.echo("OK: force-released (runs marked canceled; leases released)")
+        return
+
+    for rid in run_ids:
+        _cloud_kill_run(b, k, rid)
+
+    deadline = time.time() + max(1.0, float(wait_s))
+    remaining = set(run_ids)
+    while remaining and time.time() < deadline:
+        done: set[str] = set()
+        for rid in list(remaining):
+            flag = _cloud_kill_flag(b, k, rid)
+            if bool(flag.get("terminal")):
+                done.add(rid)
+        remaining -= done
+        if remaining:
+            time.sleep(max(0.2, float(poll_s)))
+
+    if remaining:
+        raise typer.BadParameter(
+            f"release_timeout: {len(remaining)} run(s) still non-terminal. "
+            f"Try `versa cloud release {p} --force` to release immediately."
+        )
+    typer.echo("OK: released (all active runs are terminal)")
 
 
 def _cloud_put_logs(b: str, k: str, run_id: str, chunk: str) -> None:
     _cloud_post_json(b, k, f"/api/runs/{run_id}/logs", {"chunk": chunk}, timeout_s=60.0)
 
 
-def _cloud_kill_flag(b: str, k: str, run_id: str) -> dict[str, Any]:
-    return _cloud_get_json(b, k, f"/api/runs/{run_id}/kill-flag", timeout_s=30.0)
+def _cloud_kill_flag(b: str, k: str, run_id: str, *, admin_override: bool = False) -> dict[str, Any]:
+    return _cloud_get_json(b, k, f"/api/runs/{run_id}/kill-flag", timeout_s=30.0, admin_override=admin_override)
 
 
 def _cloud_heartbeat(b: str, k: str, run_id: str) -> None:
@@ -1389,6 +1688,8 @@ def cloud_run_modal(
     base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
     requested_profile: str = typer.Option("", "--profile", help="Request a specific Modal profile (must exist in Versa)."),
+    no_preempt: bool = typer.Option(False, "--no-preempt", help="If switching profiles would be required, fail instead of prompting."),
+    assume_yes: bool = typer.Option(False, "--yes", help="Non-interactive: auto-switch profiles if needed (may release your current lease)."),
     kill_after_s: float = typer.Option(
         0.0,
         "--kill-after-s",
@@ -1418,6 +1719,51 @@ def cloud_run_modal(
 
     ensure_dir(log_dir)
 
+    def _resolve_modal_target_ref(ref: str) -> str:
+        """
+        Allow running built-in scripts from any CWD.
+
+        If user passes `scripts/foo.py::main` but their CWD doesn't contain that path,
+        resolve it to the package's `apps/versa-cli/scripts/foo.py`.
+        """
+        ref = str(ref or "").strip()
+        if not ref:
+            return ref
+
+        suffix = ""
+        file_part = ref
+        if "::" in ref:
+            file_part, rest = ref.split("::", 1)
+            suffix = f"::{rest}"
+
+        try:
+            p = Path(file_part)
+        except Exception:
+            return ref
+
+        if p.is_absolute():
+            return ref
+
+        # If it already exists relative to CWD, keep it.
+        try:
+            if p.exists():
+                return ref
+        except Exception:
+            pass
+
+        norm = file_part.replace("\\", "/")
+        if norm.startswith("scripts/"):
+            try:
+                rel = Path(norm).relative_to("scripts")
+            except Exception:
+                rel = Path(norm).name
+            scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+            cand = scripts_dir / rel
+            if cand.exists():
+                return f"{cand.as_posix()}{suffix}"
+
+        return ref
+
     run_name = name.strip() or target
     resources: dict[str, Any] = {"network": {"internet": True}}
     gt = gpu_type.strip()
@@ -1439,7 +1785,64 @@ def cloud_run_modal(
     rp = requested_profile.strip()
     if rp:
         payload["account_ref"] = rp
-    created = _cloud_post_json(b, k, "/api/runs", payload, timeout_s=60.0)
+    import requests
+
+    def _create_run() -> dict[str, Any]:
+        r = requests.post(
+            f"{b}/api/runs",
+            headers={**_versa_headers(k), "Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=60,
+        )
+        if r.status_code >= 400:
+            j = _cloud_try_json(r)
+            if j is None:
+                raise typer.BadParameter(f"upstream_non_json: HTTP {r.status_code}")
+            # Only prompt on an intentional profile switch attempt.
+            if (
+                r.status_code == 409
+                and str(j.get("error") or "") == "actor_already_holds_account"
+                and rp
+                and str(j.get("held_account_ref") or "").strip()
+                and str(j.get("requested_account_ref") or "").strip()
+            ):
+                held = str(j.get("held_account_ref") or "").strip()
+                reqd = str(j.get("requested_account_ref") or "").strip()
+                typer.echo(f"[versa] You already hold Modal profile {held!r}. Requested {reqd!r}.")
+                if no_preempt:
+                    raise typer.BadParameter("no_preempt: actor_already_holds_account (release first or use a different actor)")
+                do_switch = True if assume_yes else typer.confirm("Switch profiles now? (This will release your current lease)", default=False)
+                if do_switch:
+                    # Preferred: graceful kill then retry. If that times out, offer force-release.
+                    try:
+                        cloud_release("modal", force=False, wait_s=120.0, poll_s=poll_kill_s, base_url=b, admin_key=k)  # type: ignore[arg-type]
+                    except Exception:
+                        if assume_yes or typer.confirm("Graceful release timed out. Force-release (mark canceled immediately)?", default=False):
+                            cloud_release("modal", force=True, wait_s=0.0, poll_s=poll_kill_s, base_url=b, admin_key=k)  # type: ignore[arg-type]
+                        else:
+                            raise typer.BadParameter("switch_aborted")
+                    # Retry after release
+                    r2 = requests.post(
+                        f"{b}/api/runs",
+                        headers={**_versa_headers(k), "Content-Type": "application/json"},
+                        data=json.dumps(payload),
+                        timeout=60,
+                    )
+                    if r2.status_code >= 400:
+                        j2 = _cloud_try_json(r2)
+                        raise typer.BadParameter(f"run_create_failed: HTTP {r2.status_code}: {j2 or '<non-json>'}")
+                    j = _cloud_try_json(r2) or {}
+                    return j
+                raise typer.BadParameter("actor_already_holds_account")
+
+            raise typer.BadParameter(f"run_create_failed: HTTP {r.status_code}: {j}")
+
+        j = _cloud_try_json(r)
+        if j is None:
+            raise typer.BadParameter("upstream_non_json")
+        return j
+
+    created = _create_run()
     run = created.get("run") or {}
     run_id = str(run.get("runId") or run.get("run_id") or "")
     profile = str(run.get("accountRef") or run.get("account_ref") or "")
@@ -1478,8 +1881,10 @@ def cloud_run_modal(
         env["VERSA_MODAL_GPU_TYPE"] = gt
         env["VERSA_MODAL_GPU_COUNT"] = str(gc if gc > 0 else 1)
 
+    resolved_target = _resolve_modal_target_ref(target)
+
     # Use the current Python environment's Modal module (more reliable than relying on a `modal` shim in PATH).
-    cmd = [sys.executable, "-m", "modal", "run", target, *(extra_args or [])]
+    cmd = [sys.executable, "-m", "modal", "run", resolved_target, *(extra_args or [])]
     with open(local_log, "ab", buffering=0) as f:
         p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
 
@@ -1607,6 +2012,72 @@ def cloud_run_modal(
         timeout_s=30.0,
     )
 
+    # Always update basic validity from the actual run outcome (even when --no-sync-quota).
+    # This ensures “can I run compute?” is reflected in the shared pool immediately.
+    try:
+        valid_from_run: bool | None = None
+        last_error_from_run: str | None = None
+        skip_status_post = False
+
+        if status == "succeeded":
+            valid_from_run = True
+            last_error_from_run = ""
+        elif status == "failed":
+            # Try to derive a stable reason from the local log tail.
+            txt = ""
+            try:
+                txt = Path(local_log).read_text(encoding="utf-8", errors="ignore")[-4000:]
+            except Exception:
+                txt = ""
+            t = txt.lower()
+            if "filenotfounderror" in t or "no such file or directory" in t:
+                # Local script/module resolution error; do not poison token validity.
+                skip_status_post = True
+            if "token id is malformed" in t:
+                valid_from_run = False
+                last_error_from_run = "token_id_malformed"
+            elif "token secret is malformed" in t:
+                valid_from_run = False
+                last_error_from_run = "token_secret_malformed"
+            elif "unauthorized" in t or "http 401" in t:
+                valid_from_run = False
+                last_error_from_run = "auth_401"
+            elif "forbidden" in t or "http 403" in t:
+                valid_from_run = False
+                last_error_from_run = "auth_403"
+            elif "requested_profile_invalid" in t:
+                valid_from_run = False
+                last_error_from_run = "profile_invalid"
+            elif "requested_profile_disabled" in t or "account_disabled" in t or "frozen" in t:
+                valid_from_run = None
+                last_error_from_run = "profile_disabled_or_frozen"
+            elif "timed out" in t or "timeout" in t or "upstream_non_json" in t or "error code: 522" in t:
+                valid_from_run = None
+                last_error_from_run = "auth_transient:timeout_or_upstream"
+            else:
+                valid_from_run = False
+                last_error_from_run = "run_failed"
+
+        if (not skip_status_post) and (valid_from_run is not None or last_error_from_run is not None):
+            _cloud_post_json(
+                b,
+                k,
+                "/admin/modal/tokens/update_status",
+                {
+                    "updates": [
+                        {
+                            "profile": profile,
+                            "last_checked_at_ms": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
+                            "valid": valid_from_run,
+                            "last_error": last_error_from_run,
+                        }
+                    ]
+                },
+                timeout_s=30.0,
+            )
+    except Exception:
+        pass
+
     # Best-effort: keep Modal quota/billing signals fresh for schedulers + UI.
     if sync_quota:
         try:
@@ -1723,6 +2194,8 @@ def cloud_run_modal(
 def cloud_modal_validate(
     include_disabled: bool = typer.Option(False, "--include-disabled", help="Also validate disabled profiles (default false)."),
     only_valid: bool = typer.Option(False, "--only-valid", help="Only validate profiles currently marked valid in Versa."),
+    only_unknown: bool = typer.Option(False, "--only-unknown", help="Only validate profiles with valid=null or transient probe errors."),
+    only_invalid: bool = typer.Option(False, "--only-invalid", help="Only validate profiles currently marked invalid (valid=false)."),
     limit: int = typer.Option(0, "--limit", help="Limit number of profiles to validate (0 = all)."),
     concurrency: int = typer.Option(3, "--concurrency", help="Parallelism (profiles validated concurrently)."),
     cpu: bool = typer.Option(True, "--cpu/--no-cpu", help="Run CPU smoke test (square)."),
@@ -1742,9 +2215,9 @@ def cloud_modal_validate(
 ) -> None:
     """
     Validate Modal profiles end-to-end via Versa:
-    - CPU smoke: runs apps/versa-cli/scripts/modal_square.py::main
-    - Cancel smoke: runs apps/versa-cli/scripts/modal_sleep.py::main and auto-kills
-    - GPU smoke (optional): runs apps/versa-cli/scripts/modal_gpu_smoke.py::main
+    - CPU smoke: runs scripts/modal_square.py::main
+    - Cancel smoke: runs scripts/modal_sleep.py::main and auto-kills
+    - GPU smoke (optional): runs scripts/modal_gpu_smoke.py::main
 
     This uses `versa cloud run-modal` under the hood so it also validates:
     - profile routing (account_ref)
@@ -1767,6 +2240,14 @@ def cloud_modal_validate(
             continue
         if only_valid and t.get("valid") is not True:
             continue
+        if only_invalid and t.get("valid") is not False:
+            continue
+        if only_unknown:
+            v = t.get("valid")
+            le = str(t.get("lastError") or t.get("last_error") or "")
+            is_unknown = (v is None) or le.startswith("auth_transient:")
+            if not is_unknown:
+                continue
         profiles.append(
             {
                 "profile": prof,
@@ -1797,13 +2278,19 @@ def cloud_modal_validate(
         except Exception as e:
             return {"ok": False, "returncode": int(p.returncode), "output": out[i:][-2000:], "error": f"json_parse_failed:{type(e).__name__}:{e}"}
 
-    square_target = "apps/versa-cli/scripts/modal_square.py::main"
-    sleep_target = "apps/versa-cli/scripts/modal_sleep.py::main"
-    gpu_target = "apps/versa-cli/scripts/modal_gpu_smoke.py::main"
+    # Use absolute paths so callers can run this command from any CWD.
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    square_target = f"{(scripts_dir / 'modal_square.py').as_posix()}::main"
+    sleep_target = f"{(scripts_dir / 'modal_sleep.py').as_posix()}::main"
+    gpu_target = f"{(scripts_dir / 'modal_gpu_smoke.py').as_posix()}::main"
 
     def _validate_profile(row: dict[str, Any]) -> dict[str, Any]:
         prof = str(row["profile"])
         res: dict[str, Any] = {"profile": prof, "meta": row, "cpu": None, "cancel": None, "gpu": None}
+        # Isolation: each validated profile uses a distinct actor_id so parallel validation
+        # doesn't collide with "actor already holds account" safety checks.
+        actor_id = f"va_{uuid.uuid4()}"
+        base_env = {"VERSA_API_BASE": b, "VERSA_ADMIN_KEY": k, "VERSA_ACTOR_ID": actor_id}
 
         if cpu:
             res["cpu"] = _run_one(
@@ -1812,17 +2299,15 @@ def cloud_modal_validate(
                     square_target,
                     "--profile",
                     prof,
-                    "--base-url",
-                    b,
-                    "--admin-key",
-                    k,
+                    "--yes",
                     "--log-dir",
                     log_dir,
                     "--no-stream",
                     "--no-sync-quota",
                     "--kill-after-s",
                     str(float(max_run_s)),
-                ]
+                ],
+                env_overrides=base_env,
             )
 
         cpu_ok = bool((res.get("cpu") or {}).get("ok")) and str((res.get("cpu") or {}).get("status")) == "succeeded"
@@ -1834,10 +2319,7 @@ def cloud_modal_validate(
                     sleep_target,
                     "--profile",
                     prof,
-                    "--base-url",
-                    b,
-                    "--admin-key",
-                    k,
+                    "--yes",
                     "--log-dir",
                     log_dir,
                     "--no-stream",
@@ -1847,7 +2329,7 @@ def cloud_modal_validate(
                     "--kill-after-ready-s",
                     str(float(kill_after_ready_s)),
                 ],
-                env_overrides={"VERSA_SLEEP_SECONDS": str(int(sleep_seconds))},
+                env_overrides={**base_env, "VERSA_SLEEP_SECONDS": str(int(sleep_seconds))},
             )
             # Extra assertion: confirm the runner logged a Modal app stop attempt.
             try:
@@ -1871,10 +2353,7 @@ def cloud_modal_validate(
                     gpu_target,
                     "--profile",
                     prof,
-                    "--base-url",
-                    b,
-                    "--admin-key",
-                    k,
+                    "--yes",
                     "--log-dir",
                     log_dir,
                     "--no-stream",
@@ -1885,7 +2364,8 @@ def cloud_modal_validate(
                     str(gpu_type),
                     "--gpu-count",
                     str(int(gpu_count)),
-                ]
+                ],
+                env_overrides=base_env,
             )
 
         return res
@@ -1927,11 +2407,81 @@ def cloud_modal_validate(
         "gpu_succeeded": _count_ok("gpu", "succeeded") if gpu else 0,
     }
 
+    # Best-effort: push validation results back to Versa so the UI/API reflects
+    # real, end-to-end smoke test outcomes (not just whoami probes).
+    try:
+        now_ms = int(time.time() * 1000)
+        updates: list[dict[str, Any]] = []
+
+        def _classify_valid_and_error(cpu_res: dict[str, Any] | None) -> tuple[bool | None, str | None]:
+            if not isinstance(cpu_res, dict):
+                return None, "smoke_missing_result"
+
+            status = str(cpu_res.get("status") or "")
+            if bool(cpu_res.get("ok")) and status == "succeeded":
+                return True, ""
+
+            # Prefer parsing local log for human-readable errors.
+            txt = ""
+            lp = str(cpu_res.get("local_log") or "").strip()
+            if lp and Path(lp).exists():
+                try:
+                    txt = Path(lp).read_text(encoding="utf-8", errors="ignore")[-4000:]
+                except Exception:
+                    txt = ""
+            if not txt:
+                txt = str(cpu_res.get("output") or "")[-4000:]
+
+            t = txt.lower()
+            if "requested_profile_disabled" in t or "account_disabled" in t or "frozen" in t:
+                return None, "profile_disabled_or_frozen"
+            if "requested_profile_invalid" in t:
+                return False, "profile_invalid"
+            if "token id is malformed" in t:
+                return False, "token_id_malformed"
+            if "token secret is malformed" in t:
+                return False, "token_secret_malformed"
+            if "http 401" in t or "unauthorized" in t:
+                return False, "auth_401"
+            if "http 403" in t or "forbidden" in t:
+                return False, "auth_403"
+            if "timed out" in t or "timeout" in t or "522" in t or "upstream_non_json" in t:
+                return None, "auth_transient:timeout_or_upstream"
+
+            if status:
+                return False, f"smoke_failed:{status}"
+            return False, "smoke_failed"
+
+        for r in results:
+            prof = str(r.get("profile") or "").strip()
+            if not prof:
+                continue
+            v, le = _classify_valid_and_error(r.get("cpu") if isinstance(r, dict) else None)
+            updates.append(
+                {
+                    "profile": prof,
+                    "last_checked_at_ms": now_ms,
+                    "valid": v,
+                    "last_error": le,
+                }
+            )
+
+        # Chunk to avoid request size limits.
+        chunk_size = 50
+        for i in range(0, len(updates), chunk_size):
+            chunk = updates[i : i + chunk_size]
+            _cloud_post_json(b, k, "/admin/modal/tokens/update_status", {"updates": chunk}, timeout_s=60.0)
+    except Exception:
+        # Never fail the command on status sync issues.
+        pass
+
     payload = {"ok": True, "summary": summary, "results": results}
     out_p = (out or "").strip()
     if out_p:
         try:
-            Path(out_p).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            out_path = Path(out_p)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             typer.echo(f"[versa] failed to write --out {out_p!r}: {type(e).__name__}: {e}")
 
@@ -1947,6 +2497,7 @@ def cloud_logs(
     cursor: int = typer.Option(0, "--cursor", help="Start cursor (seq)."),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow until terminal."),
     poll_s: float = typer.Option(1.0, "--poll-s", help="Poll interval when following."),
+    admin: bool = typer.Option(False, "--admin", help="Admin override: allow reading logs for runs you don't own."),
     base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
 ) -> None:
@@ -1956,7 +2507,7 @@ def cloud_logs(
 
     cur = int(cursor)
     while True:
-        j = _cloud_get_json(b, k, f"/api/runs/{run_id}/logs?cursor={cur}&limit=200", timeout_s=60.0)
+        j = _cloud_get_json(b, k, f"/api/runs/{run_id}/logs?cursor={cur}&limit=200", timeout_s=60.0, admin_override=admin)
         lines = j.get("lines") or []
         for ln in lines:
             print(str(ln), end="" if str(ln).endswith("\n") else "\n")
@@ -1965,7 +2516,7 @@ def cloud_logs(
         if not follow:
             break
 
-        flag = _cloud_kill_flag(b, k, run_id)
+        flag = _cloud_kill_flag(b, k, run_id, admin_override=admin)
         if bool(flag.get("terminal")):
             break
         time.sleep(max(0.2, float(poll_s)))
@@ -1976,22 +2527,51 @@ def cloud_kill(
     run_id: str = typer.Argument(..., help="Versa run id (vr_...)."),
     wait: bool = typer.Option(False, "--wait", help="Wait until the run becomes terminal."),
     poll_s: float = typer.Option(1.0, "--poll-s", help="Poll interval for --wait."),
+    admin: bool = typer.Option(False, "--admin", help="Admin override: allow killing runs you don't own."),
     base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
 ) -> None:
     """Request kill for a run. Runners should honor kill via `/api/runs/:id/kill-flag`."""
     b = _versa_base_url(base_url)
     k = _versa_admin_key(admin_key)
-    j = _cloud_post_json(b, k, f"/api/runs/{run_id}/kill", {}, timeout_s=30.0)
+    j = _cloud_post_json(b, k, f"/api/runs/{run_id}/kill", {}, timeout_s=30.0, admin_override=admin)
     if not wait:
         _json_out(j)
         return
     while True:
-        flag = _cloud_kill_flag(b, k, run_id)
+        flag = _cloud_kill_flag(b, k, run_id, admin_override=admin)
         if bool(flag.get("terminal")):
             _json_out({"ok": True, "run_id": run_id, "terminal": True, "status": flag.get("status")})
             return
         time.sleep(max(0.2, float(poll_s)))
+
+
+@cloud_app.command("reserve")
+def cloud_reserve(
+    provider: str = typer.Argument(..., help="Provider: modal|kaggle."),
+    account_ref: str = typer.Argument(..., help="Account/profile to reserve (Modal profile or Kaggle username)."),
+    label: str = typer.Option("", "--label", help="Optional label (project/codebase) for this reservation."),
+    ttl_hours: int = typer.Option(24, "--ttl-hours", help="Reservation TTL in hours (default 24)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Reserve (lock) a specific provider account/profile without launching compute."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    p = provider.strip().lower()
+    if p not in ("modal", "kaggle"):
+        raise typer.BadParameter("provider must be modal|kaggle")
+
+    actor_id = _versa_actor_id("")
+    ttl_ms = int(max(1, int(ttl_hours)) * 60 * 60 * 1000)
+    nm = f"{p}:reserve:{label.strip()}" if label.strip() else f"{p}:reserve"
+    payload = {"provider": p, "actor_id": actor_id, "account_ref": account_ref.strip(), "name": nm, "lease_ttl_ms": ttl_ms}
+    j = _cloud_post_json(b, k, "/api/reservations", payload, timeout_s=60.0)
+    run = j.get("run") if isinstance(j, dict) else None
+    if not isinstance(run, dict) or not run.get("runId") or not run.get("accountRef"):
+        typer.echo(json.dumps(j, indent=2))
+        raise typer.Exit(1)
+    typer.echo(f"OK: reserved provider={p} account_ref={run.get('accountRef')} run_id={run.get('runId')} actor_id={actor_id}")
 
 
 # -----------------------------------------------------------------------------
@@ -2118,6 +2698,167 @@ def cloud_modal_profile_list_cmd(
     _print_table(["profile", "status", "valid", "credit", "row_id"], table_rows)
 
 
+@cloud_modal_profile_app.command("lock")
+def cloud_modal_profile_lock_cmd(
+    profile: str = typer.Argument(..., help="Modal profile name to lock (reserve) for this actor."),
+    label: str = typer.Option("", "--label", help="Optional label (project/codebase) for this lock."),
+    ttl_hours: int = typer.Option(24, "--ttl-hours", help="Lock TTL in hours (default 24)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Reserve (lock) a specific Modal profile without launching compute."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+    ttl_ms = int(max(1, ttl_hours) * 60 * 60 * 1000)
+
+    name = f"modal:lock:{label.strip()}" if label.strip() else "modal:lock"
+    payload = {
+        "provider": "modal",
+        "actor_id": actor_id,
+        "account_ref": profile.strip(),
+        "name": name,
+        "lease_ttl_ms": ttl_ms,
+    }
+    j = _cloud_post_json(b, k, "/api/reservations", payload, timeout_s=60.0)
+    run = j.get("run") if isinstance(j, dict) else None
+    if not isinstance(run, dict) or not run.get("runId") or not run.get("accountRef"):
+        typer.echo(json.dumps(j, indent=2))
+        raise typer.Exit(1)
+
+    typer.echo(f"OK: locked modal profile={run.get('accountRef')} run_id={run.get('runId')} actor_id={actor_id}")
+
+
+@cloud_modal_profile_app.command("locks")
+def cloud_modal_profile_locks_cmd(
+    limit: int = typer.Option(200, "--limit", help="Max locks to show."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """List your active Modal profile locks (reservations)."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+
+    j = _cloud_get_json(b, k, f"/api/runs?provider=modal&kind=reservation&actor_id={actor_id}&limit={int(limit)}", timeout_s=30.0)
+    runs = j.get("runs") if isinstance(j, dict) else None
+    if not isinstance(runs, list):
+        runs = []
+
+    active: list[dict[str, Any]] = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        st = str(r.get("status") or "")
+        terminal = st in ("succeeded", "failed", "canceled", "killed")
+        if terminal:
+            continue
+        active.append(r)
+
+    active.sort(key=lambda x: int(x.get("createdAtMs") or 0), reverse=True)
+    typer.echo(f"Modal locks: {len(active)} (actor_id={actor_id})")
+    for i, r in enumerate(active, start=1):
+        rid = str(r.get("runId") or "")
+        prof = str(r.get("accountRef") or "")
+        name = str(r.get("name") or "")
+        st = str(r.get("status") or "")
+        typer.echo(f"{i:3d}. {prof}  {st:<9}  {rid}  {name}")
+
+
+@cloud_modal_profile_app.command("unlock")
+def cloud_modal_profile_unlock_cmd(
+    run_id: str = typer.Option("", "--run-id", help="Reservation run_id to unlock."),
+    profile: str = typer.Option("", "--profile", help="Unlock the latest lock for this profile."),
+    all: bool = typer.Option(False, "--all", help="Unlock ALL active locks for this actor."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Release a Modal profile lock (reservation) by marking it canceled."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+
+    if not run_id and not profile and not all:
+        raise typer.BadParameter("Provide --run-id, --profile, or --all.")
+
+    targets: list[str] = []
+    if run_id.strip():
+        targets = [run_id.strip()]
+    else:
+        j = _cloud_get_json(b, k, f"/api/runs?provider=modal&kind=reservation&actor_id={actor_id}&limit=500", timeout_s=30.0)
+        runs = j.get("runs") if isinstance(j, dict) else None
+        if not isinstance(runs, list):
+            runs = []
+
+        def _is_active(r: dict[str, Any]) -> bool:
+            st = str(r.get("status") or "")
+            return st not in ("succeeded", "failed", "canceled", "killed")
+
+        active = [r for r in runs if isinstance(r, dict) and _is_active(r)]
+        if all:
+            targets = [str(r.get("runId") or "").strip() for r in active if str(r.get("runId") or "").strip()]
+        else:
+            p = profile.strip()
+            cand = [r for r in active if str(r.get("accountRef") or "").strip() == p]
+            cand.sort(key=lambda x: int(x.get("createdAtMs") or 0), reverse=True)
+            if not cand:
+                typer.echo(f"OK: no active lock found for profile={p}")
+                return
+            targets = [str(cand[0].get("runId") or "").strip()]
+
+    if not targets:
+        typer.echo("OK: nothing to unlock")
+        return
+
+    for rid in targets:
+        _cloud_post_json(b, k, f"/api/runs/{rid}/finished", {"status": "canceled"}, timeout_s=30.0)
+
+    typer.echo(f"OK: unlocked {len(targets)} lock(s) (actor_id={actor_id})")
+
+
+@cloud_modal_profile_app.command("freeze")
+def cloud_modal_profile_freeze_cmd(
+    profile: str = typer.Argument(..., help="Modal profile name to freeze (disable scheduling)."),
+    until_ms: int = typer.Option(0, "--until-ms", help="Disable until UTC ms since epoch (0 => end of current UTC month)."),
+    reason: str = typer.Option("billing_limit", "--reason", help="Reason to record (default: billing_limit)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Freeze a Modal profile globally (prevents scheduling) until end-of-month by default."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+
+    payload: dict[str, Any] = {"profile": profile.strip(), "reason": reason}
+    if until_ms and until_ms > 0:
+        payload["until_ms"] = int(until_ms)
+
+    j = _cloud_post_json(b, k, "/admin/modal/tokens/freeze", payload, timeout_s=30.0)
+    if not isinstance(j, dict) or not j.get("ok"):
+        typer.echo(json.dumps(j, indent=2))
+        raise typer.Exit(1)
+
+    dm = j.get("disabledUntilMs")
+    typer.echo(f"OK: frozen modal profile={profile.strip()} disabled_until_ms={dm} reason={j.get('disabledReason')}")
+
+
+@cloud_modal_profile_app.command("unfreeze")
+def cloud_modal_profile_unfreeze_cmd(
+    profile: str = typer.Argument(..., help="Modal profile name to unfreeze (re-enable scheduling)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Unfreeze a Modal profile globally (clears disabled_until_ms/disabled_reason)."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+
+    j = _cloud_post_json(b, k, "/admin/modal/tokens/unfreeze", {"profile": profile.strip()}, timeout_s=30.0)
+    if not isinstance(j, dict) or not j.get("ok"):
+        typer.echo(json.dumps(j, indent=2))
+        raise typer.Exit(1)
+
+    typer.echo(f"OK: unfrozen modal profile={profile.strip()}")
+
+
 @cloud_modal_app.command("import")
 def cloud_modal_import_cmd(
     profile: str = typer.Argument(..., help="Modal profile name (display name)."),
@@ -2150,11 +2891,22 @@ def cloud_modal_delete_cmd(
 @cloud_modal_app.command("probe")
 def cloud_modal_probe_cmd(
     profiles_file: str = typer.Option("", "--profiles-file", help="TSV: profile<TAB>token_id<TAB>token_secret<TAB>budget_usd (optional)."),
+    source: str = typer.Option("versa", "--source", help="Source of profiles: versa (D1+R2) | file (TSV)."),
     concurrency: int = typer.Option(8, "--concurrency", help="Concurrent probes."),
     base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Do not POST updates to Versa; just print JSON."),
+    include_disabled: bool = typer.Option(False, "--include-disabled", help="Also probe disabled/frozen profiles."),
 ) -> None:
-    cloud_modal_probe(profiles_file=profiles_file, concurrency=concurrency, base_url=base_url, admin_key=admin_key)
+    _cloud_modal_probe_impl(
+        profiles_file=profiles_file,
+        source=source,
+        concurrency=concurrency,
+        base_url=base_url,
+        admin_key=admin_key,
+        dry_run=dry_run,
+        include_disabled=include_disabled,
+    )
 
 
 @cloud_modal_app.command("probe-web")
@@ -2204,6 +2956,7 @@ def cloud_modal_run_cmd(
     base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
     admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
     requested_profile: str = typer.Option("", "--profile", help="Request a specific Modal profile (must exist in Versa)."),
+    no_preempt: bool = typer.Option(False, "--no-preempt", help="If switching profiles would be required, fail instead of prompting."),
     kill_after_s: float = typer.Option(0.0, "--kill-after-s", help="Auto-request kill after N seconds (0 disables)."),
     kill_after_ready_s: float = typer.Option(0.0, "--kill-after-ready-s", help="After Modal prints the app URL, auto-request kill after N seconds."),
     poll_kill_s: float = typer.Option(2.0, "--poll-kill-s", help="Kill-flag poll interval."),
@@ -2222,6 +2975,7 @@ def cloud_modal_run_cmd(
         base_url=base_url,
         admin_key=admin_key,
         requested_profile=requested_profile,
+        no_preempt=no_preempt,
         kill_after_s=kill_after_s,
         kill_after_ready_s=kill_after_ready_s,
         poll_kill_s=poll_kill_s,
@@ -2346,6 +3100,124 @@ def cloud_kaggle_profile_list_cmd(
         table_rows.append([username, label_s, status, max_c_s, token_id_s])
 
     _print_table(["username", "label", "status", "max", "token_id"], table_rows, right_align={3})
+
+
+@cloud_kaggle_profile_app.command("lock")
+def cloud_kaggle_profile_lock_cmd(
+    username: str = typer.Argument(..., help="Kaggle username to lock (reserve) for this actor."),
+    label: str = typer.Option("", "--label", help="Optional label (project/codebase) for this lock."),
+    ttl_hours: int = typer.Option(24, "--ttl-hours", help="Lock TTL in hours (default 24)."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Reserve (lock) a specific Kaggle account without launching compute."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+    ttl_ms = int(max(1, ttl_hours) * 60 * 60 * 1000)
+
+    name = f"kaggle:lock:{label.strip()}" if label.strip() else "kaggle:lock"
+    payload = {
+        "provider": "kaggle",
+        "actor_id": actor_id,
+        "account_ref": username.strip(),
+        "name": name,
+        "lease_ttl_ms": ttl_ms,
+    }
+    j = _cloud_post_json(b, k, "/api/reservations", payload, timeout_s=60.0)
+    run = j.get("run") if isinstance(j, dict) else None
+    if not isinstance(run, dict) or not run.get("runId") or not run.get("accountRef"):
+        typer.echo(json.dumps(j, indent=2))
+        raise typer.Exit(1)
+
+    typer.echo(f"OK: locked kaggle username={run.get('accountRef')} run_id={run.get('runId')} actor_id={actor_id}")
+
+
+@cloud_kaggle_profile_app.command("locks")
+def cloud_kaggle_profile_locks_cmd(
+    limit: int = typer.Option(200, "--limit", help="Max locks to show."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """List your active Kaggle locks (reservations)."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+
+    j = _cloud_get_json(b, k, f"/api/runs?provider=kaggle&kind=reservation&actor_id={actor_id}&limit={int(limit)}", timeout_s=30.0)
+    runs = j.get("runs") if isinstance(j, dict) else None
+    if not isinstance(runs, list):
+        runs = []
+
+    active: list[dict[str, Any]] = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        st = str(r.get("status") or "")
+        terminal = st in ("succeeded", "failed", "canceled", "killed")
+        if terminal:
+            continue
+        active.append(r)
+
+    active.sort(key=lambda x: int(x.get("createdAtMs") or 0), reverse=True)
+    typer.echo(f"Kaggle locks: {len(active)} (actor_id={actor_id})")
+    for i, r in enumerate(active, start=1):
+        rid = str(r.get("runId") or "")
+        user = str(r.get("accountRef") or "")
+        name = str(r.get("name") or "")
+        st = str(r.get("status") or "")
+        typer.echo(f"{i:3d}. {user}  {st:<9}  {rid}  {name}")
+
+
+@cloud_kaggle_profile_app.command("unlock")
+def cloud_kaggle_profile_unlock_cmd(
+    run_id: str = typer.Option("", "--run-id", help="Reservation run_id to unlock."),
+    username: str = typer.Option("", "--username", help="Unlock the latest lock for this username."),
+    all: bool = typer.Option(False, "--all", help="Unlock ALL active locks for this actor."),
+    base_url: str = typer.Option("", "--base-url", help="Versa API base URL."),
+    admin_key: str = typer.Option("", "--admin-key", help="Admin API key (Bearer token)."),
+) -> None:
+    """Release a Kaggle account lock (reservation) by marking it canceled."""
+    b = _versa_base_url(base_url)
+    k = _versa_admin_key(admin_key)
+    actor_id = _versa_actor_id("")
+
+    if not run_id and not username and not all:
+        raise typer.BadParameter("Provide --run-id, --username, or --all.")
+
+    targets: list[str] = []
+    if run_id.strip():
+        targets = [run_id.strip()]
+    else:
+        j = _cloud_get_json(b, k, f"/api/runs?provider=kaggle&kind=reservation&actor_id={actor_id}&limit=500", timeout_s=30.0)
+        runs = j.get("runs") if isinstance(j, dict) else None
+        if not isinstance(runs, list):
+            runs = []
+
+        def _is_active(r: dict[str, Any]) -> bool:
+            st = str(r.get("status") or "")
+            return st not in ("succeeded", "failed", "canceled", "killed")
+
+        active = [r for r in runs if isinstance(r, dict) and _is_active(r)]
+        if all:
+            targets = [str(r.get("runId") or "").strip() for r in active if str(r.get("runId") or "").strip()]
+        else:
+            u = username.strip()
+            cand = [r for r in active if str(r.get("accountRef") or "").strip() == u]
+            cand.sort(key=lambda x: int(x.get("createdAtMs") or 0), reverse=True)
+            if not cand:
+                typer.echo(f"OK: no active lock found for username={u}")
+                return
+            targets = [str(cand[0].get("runId") or "").strip()]
+
+    if not targets:
+        typer.echo("OK: nothing to unlock")
+        return
+
+    for rid in targets:
+        _cloud_post_json(b, k, f"/api/runs/{rid}/finished", {"status": "canceled"}, timeout_s=30.0)
+
+    typer.echo(f"OK: unlocked {len(targets)} lock(s) (actor_id={actor_id})")
 
 
 @cloud_codex_app.command("tokens")
