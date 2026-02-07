@@ -1783,7 +1783,44 @@ def cloud_run_modal(
         "actor_id": _versa_actor_id(""),
     }
     rp = requested_profile.strip()
+
+    modal_tokens_cache: list[dict[str, Any]] | None = None
+
+    def _get_modal_tokens() -> list[dict[str, Any]]:
+        nonlocal modal_tokens_cache
+        if modal_tokens_cache is None:
+            j = _cloud_get_json(b, k, "/admin/modal/tokens", timeout_s=30.0)
+            items = j.get("tokens") if isinstance(j, dict) else None
+            modal_tokens_cache = items if isinstance(items, list) else []
+        return modal_tokens_cache
+
+    def _profile_disabled_state(profile: str) -> bool | None:
+        """Return True if disabled, False if enabled, None if unknown profile."""
+        p = str(profile or "").strip()
+        if not p:
+            return None
+        target = p.lower()
+        has_any = False
+        has_enabled = False
+        for it in _get_modal_tokens():
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("profile") or "").strip()
+            if not name or name.lower() != target:
+                continue
+            has_any = True
+            if not bool(it.get("disabled")):
+                has_enabled = True
+        if not has_any:
+            return None
+        return (not has_enabled)
+
     if rp:
+        st = _profile_disabled_state(rp)
+        if st is None:
+            raise typer.BadParameter(f"requested_profile_not_found: {rp!r}")
+        if st is True:
+            raise typer.BadParameter(f"requested_profile_disabled: {rp!r}")
         payload["account_ref"] = rp
     import requests
 
@@ -1850,6 +1887,20 @@ def cloud_run_modal(
         raise typer.BadParameter(f"run_create_failed: {created}")
     if not profile:
         raise typer.BadParameter("No Modal profile available (import tokens + probe status first).")
+
+    # Safety: never proceed if the server assigns a disabled/frozen profile.
+    # If this happens, cancel/kill immediately so we don't burn spend on a frozen account.
+    assigned_disabled = _profile_disabled_state(profile)
+    if assigned_disabled is True:
+        try:
+            _cloud_force_finish_run(b, k, run_id, status="canceled")
+        except Exception:
+            pass
+        try:
+            _cloud_kill_run(b, k, run_id)
+        except Exception:
+            pass
+        raise typer.BadParameter(f"assigned_profile_disabled: {profile!r}")
     if rp and profile != rp:
         raise typer.BadParameter(f"requested_profile_mismatch: requested={rp!r} assigned={profile!r}")
 
